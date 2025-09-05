@@ -21,13 +21,13 @@ app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
 
 // ---------- ENV ----------
 const PORT = process.env.PORT || 5000;
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/hybridvote';
-const JWT_SECRET = process.env.JWT_SECRET || 'change_this_in_prod';
-const ADMIN_INVITE_CODE = process.env.ADMIN_INVITE_CODE || 'ADMIN2025';
-const RECAPTCHA_SECRET = process.env.RECAPTCHA_SECRET || '';
-const RPC_URL = process.env.RPC_URL_BSC_TESTNET || 'https://data-seed-prebsc-1-s1.binance.org:8545/';
-const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || '';
-const DEPLOYER_PRIVATE_KEY = process.env.DEPLOYER_PRIVATE_KEY || '';
+const MONGO_URI = process.env.MONGO_URI;
+const JWT_SECRET = process.env.JWT_SECRET;
+const ADMIN_INVITE_CODE = process.env.ADMIN_INVITE_CODE;
+const RECAPTCHA_SECRET = process.env.RECAPTCHA_SECRET;
+const RPC_URL = process.env.RPC_URL_BSC_TESTNET;
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
+const DEPLOYER_PRIVATE_KEY = process.env.DEPLOYER_PRIVATE_KEY;
 
 // ---------- MONGOOSE MODELS ----------
 mongoose.set('strictQuery', false);
@@ -70,7 +70,7 @@ const BlacklistedToken = mongoose.model('BlacklistedToken', blacklistedTokenSche
 const Election = mongoose.model('Election', electionSchema);
 
 // ---------- CONTRACT SETUP ----------
-const contractABI = [
+const contractABI =[
     {
       "inputs": [],
       "stateMutability": "nonpayable",
@@ -502,7 +502,7 @@ const contractRead = CONTRACT_ADDRESS ? new ethers.Contract(CONTRACT_ADDRESS, co
 
 // ---------- HELPERS ----------
 function signToken(user) {
-  return jwt.sign({ id: user._id.toString(), role: user.role, email: user.email || null }, JWT_SECRET, { expiresIn: '7d' });
+  return jwt.sign({ id: user._id.toString(), role: user.role, email: user.email || null }, JWT_SECRET, { expiresIn: '24h' });
 }
 
 async function authMiddleware(req, res, next) {
@@ -621,7 +621,10 @@ app.post('/api/auth/verify-link', authMiddleware, async (req,res) => {
     const nonce = req.user.walletNonce;
     if (!nonce) return res.status(400).json({ msg: 'No challenge issued. Please request a challenge first.' });
 
-    const message = `Link your wallet to HybridVote by signing this message. Nonce: ${nonce}`;
+    // --- FIX IS HERE ---
+    // The message MUST match the one from the /challenge endpoint exactly.
+    const message = `Link your wallet to AuraVote by signing this message. Nonce: ${nonce}`;
+    
     let recovered;
     try {
       recovered = ethers.verifyMessage(message, signature);
@@ -651,10 +654,14 @@ app.get('/api/elections', async (req,res) => {
 });
 
 app.get('/api/elections/active', async (req,res) => {
+  const now = new Date();
   const el = await Election.findOne({
-    closed: false,
-    startAt: { $lte: new Date() },
-    $or: [{ endAt: null }, { endAt: { $gte: new Date() }}]
+    closed: false, // Must not be manually closed
+    startAt: { $lte: now }, // Start date must be in the past
+    $or: [
+      { endAt: null }, // Or it has no end date
+      { endAt: { $gte: now } } // Or its end date is in the future
+    ]
   }).sort({ createdAt: -1 }).lean();
 
   if (!el) return res.status(404).json({ msg: 'No active election' });
@@ -663,14 +670,63 @@ app.get('/api/elections/active', async (req,res) => {
 
 app.get('/api/elections/results', async (req, res) => {
     try {
-        const el = await Election.findOne({
-          $or: [{ closed: true }, { endAt: { $ne: null, $lt: new Date() }}]
-        }).sort({ createdAt: -1 }).lean();
+        const { id } = req.query;
+        const now = new Date();
+        let election;
 
-        if (!el) return res.status(404).json({ msg: 'No completed election results found.' });
-        res.json({ title: el.title, results: el.candidates });
+        if (id && id !== 'current') {
+            // If a specific ID is requested, find that election.
+            election = await Election.findOne({ onChainId: id }).lean();
+        } else {
+            // Otherwise, find the *most recently finished* election as the default.
+            election = await Election.findOne({
+                // An election is considered finished if it's closed OR its end date has passed
+                $or: [{ closed: true }, { endAt: { $ne: null, $lt: now } }]
+            }).sort({ endAt: -1, createdAt: -1 }).lean(); // Sort by end date first, then creation date
+
+            // If no finished election is found, THEN look for a live one.
+            if (!election) {
+                election = await Election.findOne({
+                    closed: false,
+                    startAt: { $lte: now },
+                    $or: [{ endAt: null }, { endAt: { $gte: now } }]
+                }).sort({ createdAt: -1 }).lean();
+            }
+        }
+        
+        if (!election) return res.status(404).json({ msg: 'No election results found.' });
+        
+        let status = 'Finished';
+        if (election.closed) {
+            status = 'Closed';
+        } else {
+            const start = election.startAt ? new Date(election.startAt) : null;
+            const end = election.endAt ? new Date(election.endAt) : null;
+            if (start && now < start) status = 'Scheduled';
+            else if (end && now > end) status = 'Finished'; // This now correctly marks ended elections
+            else status = 'Live';
+        }
+
+        res.json({ title: election.title, results: election.candidates, status });
+
     } catch(err) {
         console.error('results err', err);
+        res.status(500).json({ msg: 'Server error' });
+    }
+});
+
+app.get('/api/elections/history', async (req, res) => {
+    try {
+        const now = new Date();
+        const finishedElections = await Election.find({
+            $or: [{ closed: true }, { endAt: { $ne: null, $lt: now }}]
+        })
+        .sort({ endAt: -1 })
+        .select('title onChainId')
+        .lean();
+        res.json(finishedElections);
+    } catch (err) {
+        console.error('history err', err);
         res.status(500).json({ msg: 'Server error' });
     }
 });
@@ -701,15 +757,11 @@ app.post('/api/admin/elections', authMiddleware, adminOnly, async (req,res) => {
     if (!onChainId) throw new Error("Could not find ElectionCreated event in transaction logs.");
 
     const doc = new Election({
-      title,
-      description,
-      onChainId,
+      title, description, onChainId,
       startAt: startAt ? new Date(startAt) : null,
       endAt: endAt ? new Date(endAt) : null,
-      closed: false,
-      candidates: []
+      closed: false, candidates: []
     });
-
     await doc.save();
     res.json({ ok:true, txHash: receipt.hash, onChainId });
   } catch (err) {
@@ -722,12 +774,9 @@ app.post('/api/admin/elections/:onChainId/candidates', authMiddleware, adminOnly
   try {
     const { onChainId } = req.params;
     const { name, party } = req.body;
-
     if (!contract) return res.status(500).json({ msg: 'Contract not configured' });
-
     const tx = await contract.addCandidate(onChainId, name || 'Candidate', party || '');
     const receipt = await tx.wait();
-
     res.json({ ok:true, txHash: receipt.hash });
   } catch (err) {
     console.error('add candidate err', err);
@@ -735,19 +784,13 @@ app.post('/api/admin/elections/:onChainId/candidates', authMiddleware, adminOnly
   }
 });
 
-// NEW: Endpoint for an admin to close an election
 app.post('/api/admin/elections/:onChainId/close', authMiddleware, adminOnly, async (req, res) => {
   try {
     const { onChainId } = req.params;
     if (!contract) return res.status(500).json({ msg: 'Contract not configured' });
-
-    // Send the transaction to the blockchain
     const tx = await contract.toggleCloseElection(onChainId, true);
     const receipt = await tx.wait();
-
-    // Update the election status in our database
     await Election.updateOne({ onChainId }, { $set: { closed: true } });
-
     res.json({ ok: true, txHash: receipt.hash });
   } catch (err) {
     console.error('close election err', err);
@@ -755,45 +798,42 @@ app.post('/api/admin/elections/:onChainId/close', authMiddleware, adminOnly, asy
   }
 });
 
-
 app.post('/api/verify/vote', authMiddleware, async (req,res) => {
   try {
     const { txHash, electionId, candidateId } = req.body;
     if (!txHash) return res.status(400).json({ msg: 'txHash required' });
-
     const receipt = await provider.getTransactionReceipt(txHash);
     if (!receipt || receipt.status === 0) return res.status(400).json({ msg:'Transaction failed or not found' });
-
     const iface = new Interface(contractABI);
-    const votedLog = receipt.logs.map(log => {
-        try { return iface.parseLog(log); } catch { return null; }
-    }).find(log => log && log.name === 'Voted');
-
+    const votedLog = receipt.logs.map(log => { try { return iface.parseLog(log); } catch { return null; } }).find(log => log && log.name === 'Voted');
     if (!votedLog) return res.status(400).json({ msg: 'No Voted event found in transaction' });
-
     const { electionId: evElectionId, candidateId: evCandidateId, voter: evVoter } = votedLog.args;
-
-    if (evElectionId.toString() !== electionId.toString() || evCandidateId.toString() !== candidateId.toString()) {
-        return res.status(400).json({ msg:'Event data does not match request' });
-    }
-
+    if (evElectionId.toString() !== electionId.toString() || evCandidateId.toString() !== candidateId.toString()) { return res.status(400).json({ msg:'Event data does not match request' }); }
     if (!req.user.walletAddress) return res.status(400).json({ msg:'User has no linked wallet' });
     if (req.user.walletAddress.toLowerCase() !== evVoter.toLowerCase()) return res.status(400).json({ msg:'Vote was cast by a different wallet' });
-
     req.user.hasVotedOn.set(electionId.toString(), true);
     await User.findByIdAndUpdate(req.user._id, { $set: { [`hasVotedOn.${electionId}`]: true } });
-
-    await Election.updateOne(
-        { onChainId: electionId.toString(), 'candidates.onChainId': candidateId.toString() },
-        { $inc: { votesTotal: 1, 'candidates.$.votes': 1 } }
-    );
-
+    await Election.updateOne({ onChainId: electionId.toString(), 'candidates.onChainId': candidateId.toString() }, { $inc: { votesTotal: 1, 'candidates.$.votes': 1 } });
     res.json({ ok:true });
   } catch (err) {
     console.error('verify vote err', err);
     res.status(500).json({ msg: 'Verification failed', error: err.message });
   }
 });
+
+// --- THIS IS THE NEW, CORRECTLY PLACED BLOCK ---
+app.post('/api/auth/disconnect-wallet', authMiddleware, async (req, res) => {
+    try {
+        req.user.walletAddress = null;
+        await req.user.save();
+        const { _id, name, email, role, walletAddress, hasVotedOn } = req.user;
+        res.json({ id: _id, name, email, role, walletAddress, hasVotedOn });
+    } catch (err) {
+        console.error('Disconnect wallet error:', err);
+        res.status(500).json({ msg: 'Server error while disconnecting wallet.' });
+    }
+});
+// --- END OF NEW BLOCK ---
 
 // ---------- EVENT LISTENER ----------
 if (contractRead) {
@@ -803,14 +843,8 @@ if (contractRead) {
       const onChainId = electionId.toString();
       const candidateChainId = candidateId.toString();
       const el = await Election.findOne({ onChainId });
-
       if (el && !el.candidates.some(c => c.onChainId === candidateChainId)) {
-        el.candidates.push({
-          onChainId: candidateChainId,
-          name: name.toString(),
-          party: party.toString(),
-          votes: 0
-        });
+        el.candidates.push({ onChainId: candidateChainId, name: name.toString(), party: party.toString(), votes: 0 });
         await el.save();
         console.log(`[EVENT] Synced CandidateAdded: Election ${onChainId}, Candidate ${candidateChainId}`);
       }
